@@ -2,7 +2,7 @@ import asyncio
 import logging
 import sqlite3
 from datetime import datetime
-
+ 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
@@ -17,58 +17,26 @@ from aiogram.types import (
     InlineKeyboardButton,
     CallbackQuery,
 )
-
+ 
 import config
-
+ 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
+ 
 bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
-
+ 
 DB_PATH = "orders.db"
-
-
+ 
+ 
 # ---------- DATABASE ----------
-
-def init_db("""
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_setting(key: str, default: str = None):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else default
-
-
-def set_setting(key: str, value: str):
+ 
+def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO settings (key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (key, value),
-    )
-    conn.commit()
-    conn.close()
-
-
-def save_order(user_id, username, full_name, product, size, contact, comment):
         """
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,10 +52,39 @@ def save_order(user_id, username, full_name, product, size, contact, comment):
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
     conn.commit()
     conn.close()
-
-
+ 
+ 
+def get_setting(key: str, default: str = None):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else default
+ 
+ 
+def set_setting(key: str, value: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+    conn.commit()
+    conn.close()
+ 
+ 
 def save_order(user_id, username, full_name, product, size, contact, comment):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -111,16 +108,16 @@ def save_order(user_id, username, full_name, product, size, contact, comment):
     order_id = cur.lastrowid
     conn.close()
     return order_id
-
-
+ 
+ 
 def update_order_status(order_id: int, status: str):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
     conn.commit()
     conn.close()
-
-
+ 
+ 
 def get_order(order_id: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -128,8 +125,8 @@ def get_order(order_id: int):
     row = cur.fetchone()
     conn.close()
     return row
-
-
+ 
+ 
 def get_user_orders(user_id: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -140,10 +137,10 @@ def get_user_orders(user_id: int):
     rows = cur.fetchall()
     conn.close()
     return rows
-
-
+ 
+ 
 # ---------- STATES ----------
-
+ 
 class OrderForm(StatesGroup):
     full_name = State()
     product = State()
@@ -151,10 +148,10 @@ class OrderForm(StatesGroup):
     contact = State()
     comment = State()
     confirm = State()
-
-
+ 
+ 
 # ---------- KEYBOARDS ----------
-
+ 
 def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -163,22 +160,22 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
         ],
         resize_keyboard=True,
     )
-
-
+ 
+ 
 def cancel_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="❌ Отмена")]],
         resize_keyboard=True,
     )
-
-
+ 
+ 
 def skip_or_cancel_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="Пропустить")], [KeyboardButton(text="❌ Отмена")]],
         resize_keyboard=True,
     )
-
-
+ 
+ 
 def confirm_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -187,8 +184,8 @@ def confirm_kb() -> ReplyKeyboardMarkup:
         ],
         resize_keyboard=True,
     )
-
-
+ 
+ 
 def admin_order_kb(order_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -198,21 +195,26 @@ def admin_order_kb(order_id: int) -> InlineKeyboardMarkup:
             ]
         ]
     )
-
-
+ 
+ 
 # ---------- HANDLERS: BASIC ----------
-
+ 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
+ 
+    rate = get_setting("yuan_rate")
+    rate_line = f"\n💱 Текущий курс юаня: 1 CNY = {rate} ₽\n" if rate else ""
+ 
     await message.answer(
-        "👋 Привет! Это бот для заказа вещей с Poizon.\n\n"
+        "👋 Привет! Это бот для заказа вещей с Poizon.\n"
+        f"{rate_line}\n"
         "Заполни короткую форму — я передам заявку менеджеру, "
         "и с тобой свяжутся для уточнения деталей и оплаты.",
         reply_markup=main_menu_kb(),
     )
-
-
+ 
+ 
 @router.message(Command("help"))
 @router.message(F.text == "ℹ️ Помощь")
 async def cmd_help(message: Message):
@@ -225,10 +227,11 @@ async def cmd_help(message: Message):
         "Команды:\n"
         "/order — оформить новый заказ\n"
         "/myorders — посмотреть свои заявки\n"
+        "/rate — посмотреть текущий курс юаня\n"
         "/cancel — отменить текущее оформление"
     )
-
-
+ 
+ 
 @router.message(Command("cancel"))
 @router.message(F.text == "❌ Отмена")
 async def cmd_cancel(message: Message, state: FSMContext):
@@ -238,20 +241,59 @@ async def cmd_cancel(message: Message, state: FSMContext):
         return
     await state.clear()
     await message.answer("Оформление отменено.", reply_markup=main_menu_kb())
-
-
+ 
+ 
+# ---------- HANDLERS: EXCHANGE RATE ----------
+ 
+@router.message(Command("setrate"))
+async def set_rate(message: Message):
+    if message.from_user.id not in config.ADMIN_IDS:
+        await message.answer("Эта команда доступна только администратору.")
+        return
+ 
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "Укажи курс после команды, например:\n/setrate 12.85"
+        )
+        return
+ 
+    rate_text = parts[1].replace(",", ".").strip()
+    try:
+        rate_value = float(rate_text)
+    except ValueError:
+        await message.answer("Не понял курс. Пример: /setrate 12.85")
+        return
+ 
+    set_setting("yuan_rate", str(rate_value))
+    await message.answer(f"✅ Курс юаня обновлён: 1 CNY = {rate_value} ₽")
+ 
+ 
+@router.message(Command("rate"))
+async def show_rate(message: Message):
+    rate = get_setting("yuan_rate")
+    if rate is None:
+        await message.answer("Курс юаня пока не установлен.")
+        return
+    await message.answer(f"💱 Текущий курс: 1 CNY = {rate} ₽")
+ 
+ 
 # ---------- HANDLERS: ORDER FORM ----------
-
+ 
 @router.message(Command("order"))
 @router.message(F.text == "🛒 Оформить заказ")
 async def start_order(message: Message, state: FSMContext):
+    rate = get_setting("yuan_rate")
+    if rate:
+        await message.answer(f"💱 Курс на сейчас: 1 CNY = {rate} ₽")
+ 
     await state.set_state(OrderForm.full_name)
     await message.answer(
         "Как к тебе обращаться? Напиши имя и фамилию.",
         reply_markup=cancel_kb(),
     )
-
-
+ 
+ 
 @router.message(OrderForm.full_name)
 async def process_full_name(message: Message, state: FSMContext):
     if not message.text or len(message.text) < 2:
@@ -263,8 +305,8 @@ async def process_full_name(message: Message, state: FSMContext):
         "Отправь ссылку на товар с Poizon (или его название/описание, если ссылки нет).",
         reply_markup=cancel_kb(),
     )
-
-
+ 
+ 
 @router.message(OrderForm.product)
 async def process_product(message: Message, state: FSMContext):
     if not message.text:
@@ -276,8 +318,8 @@ async def process_product(message: Message, state: FSMContext):
         "Укажи нужный размер (например: EU 42, US 9, L, или размер в см).",
         reply_markup=cancel_kb(),
     )
-
-
+ 
+ 
 @router.message(OrderForm.size)
 async def process_size(message: Message, state: FSMContext):
     if not message.text:
@@ -289,8 +331,8 @@ async def process_size(message: Message, state: FSMContext):
         "Оставь контакт для связи: номер телефона или @username.",
         reply_markup=cancel_kb(),
     )
-
-
+ 
+ 
 @router.message(OrderForm.contact)
 async def process_contact(message: Message, state: FSMContext):
     if not message.text:
@@ -303,13 +345,13 @@ async def process_contact(message: Message, state: FSMContext):
         "Если нет — нажми «Пропустить».",
         reply_markup=skip_or_cancel_kb(),
     )
-
-
+ 
+ 
 @router.message(OrderForm.comment)
 async def process_comment(message: Message, state: FSMContext):
     comment = "" if message.text == "Пропустить" else (message.text or "")
     await state.update_data(comment=comment)
-
+ 
     data = await state.get_data()
     summary = (
         "Проверь данные заказа:\n\n"
@@ -322,8 +364,8 @@ async def process_comment(message: Message, state: FSMContext):
     )
     await state.set_state(OrderForm.confirm)
     await message.answer(summary, reply_markup=confirm_kb())
-
-
+ 
+ 
 @router.message(OrderForm.confirm, F.text == "✅ Подтвердить")
 async def confirm_order(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -337,13 +379,13 @@ async def confirm_order(message: Message, state: FSMContext):
         comment=data["comment"],
     )
     await state.clear()
-
+ 
     await message.answer(
         f"✅ Заявка №{order_id} принята!\n"
         "Менеджер свяжется с тобой в ближайшее время для уточнения стоимости и оплаты.",
         reply_markup=main_menu_kb(),
     )
-
+ 
     admin_text = (
         f"🆕 Новая заявка №{order_id}\n\n"
         f"👤 Имя: {data['full_name']}\n"
@@ -358,10 +400,10 @@ async def confirm_order(message: Message, state: FSMContext):
             await bot.send_message(admin_id, admin_text, reply_markup=admin_order_kb(order_id))
         except Exception as e:
             logger.warning(f"Не удалось отправить уведомление админу {admin_id}: {e}")
-
-
+ 
+ 
 # ---------- HANDLERS: MY ORDERS ----------
-
+ 
 @router.message(Command("myorders"))
 @router.message(F.text == "📦 Мои заказы")
 async def my_orders(message: Message):
@@ -369,30 +411,30 @@ async def my_orders(message: Message):
     if not orders:
         await message.answer("У тебя пока нет заявок. Нажми «Оформить заказ», чтобы создать первую.")
         return
-
+ 
     status_labels = {
         "new": "🆕 Новая",
         "accepted": "✅ Принята",
         "rejected": "❌ Отклонена",
     }
-
+ 
     lines = ["Твои заявки:\n"]
     for order_id, product, size, status, created_at in orders:
         label = status_labels.get(status, status)
         product_short = product if len(product) <= 40 else product[:37] + "..."
         lines.append(f"№{order_id} • {product_short} • размер {size} • {label} • {created_at}")
-
+ 
     await message.answer("\n".join(lines))
-
-
-# ---------- HANDLERS: ADMIN CALLBACKS ----------
-
+ 
+ 
+# ---------- HANDLERS: ADMIN — ALL ORDERS ----------
+ 
 @router.message(Command("allorders"))
 async def all_orders(message: Message):
     if message.from_user.id not in config.ADMIN_IDS:
         await message.answer("Эта команда доступна только администратору.")
         return
-
+ 
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
@@ -400,17 +442,17 @@ async def all_orders(message: Message):
     )
     rows = cur.fetchall()
     conn.close()
-
+ 
     if not rows:
         await message.answer("Заказов пока нет.")
         return
-
+ 
     status_labels = {
         "new": "🆕 Новая",
         "accepted": "✅ Принята",
         "rejected": "❌ Отклонена",
     }
-
+ 
     lines = ["📋 Последние заказы (макс. 30):\n"]
     for order_id, full_name, product, size, contact, status, created_at in rows:
         label = status_labels.get(status, status)
@@ -418,12 +460,14 @@ async def all_orders(message: Message):
         lines.append(
             f"№{order_id} • {full_name} • {product_short} • {size} • {contact} • {label} • {created_at}"
         )
-
+ 
     text = "\n".join(lines)
-    # Telegram ограничивает сообщение 4096 символами — режем на части при необходимости
     for i in range(0, len(text), 4000):
         await message.answer(text[i:i + 4000])
-
+ 
+ 
+# ---------- HANDLERS: ADMIN CALLBACKS ----------
+ 
 @router.callback_query(F.data.startswith("accept_"))
 async def admin_accept(callback: CallbackQuery):
     if callback.from_user.id not in config.ADMIN_IDS:
@@ -440,8 +484,8 @@ async def admin_accept(callback: CallbackQuery):
             pass
     await callback.message.edit_text(callback.message.text + "\n\n✅ Принята")
     await callback.answer("Заявка принята")
-
-
+ 
+ 
 @router.callback_query(F.data.startswith("reject_"))
 async def admin_reject(callback: CallbackQuery):
     if callback.from_user.id not in config.ADMIN_IDS:
@@ -458,25 +502,25 @@ async def admin_reject(callback: CallbackQuery):
             pass
     await callback.message.edit_text(callback.message.text + "\n\n❌ Отклонена")
     await callback.answer("Заявка отклонена")
-
-
+ 
+ 
 # ---------- FALLBACK ----------
-
+ 
 @router.message()
 async def fallback(message: Message):
     await message.answer(
         "Не совсем понял 🙂 Используй меню ниже или команду /order, чтобы оформить заказ.",
         reply_markup=main_menu_kb(),
     )
-
-
+ 
+ 
 # ---------- ENTRYPOINT ----------
-
+ 
 async def main():
     init_db()
     logger.info("Бот запущен")
     await dp.start_polling(bot)
-
-
+ 
+ 
 if __name__ == "__main__":
     asyncio.run(main())
