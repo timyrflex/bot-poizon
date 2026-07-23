@@ -4,10 +4,7 @@ import os
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 
 # ID админов для отправки уведомлений о новых заказах
-# Замените на ваши ID (можно получить через @userinfobot)
-ADMIN_IDS = [
-    # Добавьте ID админов здесь, например: 123456789, 987654321
-]
+ADMIN_IDS = [7041564361]
 
 # Если ADMIN_IDS пуст, выведет предупреждение
 if not ADMIN_IDS:
