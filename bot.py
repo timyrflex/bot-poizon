@@ -355,6 +355,43 @@ async def my_orders(message: Message):
 
 # ---------- HANDLERS: ADMIN CALLBACKS ----------
 
+@router.message(Command("allorders"))
+async def all_orders(message: Message):
+    if message.from_user.id not in config.ADMIN_IDS:
+        await message.answer("Эта команда доступна только администратору.")
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, full_name, product, size, contact, status, created_at FROM orders ORDER BY id DESC LIMIT 30"
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await message.answer("Заказов пока нет.")
+        return
+
+    status_labels = {
+        "new": "🆕 Новая",
+        "accepted": "✅ Принята",
+        "rejected": "❌ Отклонена",
+    }
+
+    lines = ["📋 Последние заказы (макс. 30):\n"]
+    for order_id, full_name, product, size, contact, status, created_at in rows:
+        label = status_labels.get(status, status)
+        product_short = product if len(product) <= 35 else product[:32] + "..."
+        lines.append(
+            f"№{order_id} • {full_name} • {product_short} • {size} • {contact} • {label} • {created_at}"
+        )
+
+    text = "\n".join(lines)
+    # Telegram ограничивает сообщение 4096 символами — режем на части при необходимости
+    for i in range(0, len(text), 4000):
+        await message.answer(text[i:i + 4000])
+
 @router.callback_query(F.data.startswith("accept_"))
 async def admin_accept(callback: CallbackQuery):
     if callback.from_user.id not in config.ADMIN_IDS:
