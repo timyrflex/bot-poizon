@@ -1,7 +1,7 @@
 import os
 
 # Получаем токен из переменной окружения (установлена в Railway)
-BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+BOT_TOKEN = os.getenv('8691454968:AAEGtXcesWp97_PkFj6rGjBHTgV4pvTVl0s')
 
 # ID админов для отправки уведомлений о новых заказах
 ADMIN_IDS = [7041564361]
