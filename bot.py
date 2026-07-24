@@ -1,7 +1,10 @@
 import asyncio
 import logging
 import sqlite3
+import uuid
 from datetime import datetime
+
+import requests
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart, Command
@@ -30,6 +33,9 @@ dp.include_router(router)
 
 DB_PATH = "orders.db"
 DELIVERY_USD_PER_KG = 8  # стоимость авто-доставки: 8$ за кг
+PURCHASE_COMMISSION_PERCENT = 10  # комиссия за выкуп товара, %
+
+YOOKASSA_API_URL = "https://api.yookassa.ru/v3/payments"
 
 
 # ---------- DATABASE ----------
@@ -56,6 +62,8 @@ def init_db():
             contact TEXT,
             comment TEXT,
             status TEXT DEFAULT 'new',
+            payment_id TEXT,
+            payment_status TEXT DEFAULT 'not_required',
             created_at TEXT
         )
         """
@@ -71,7 +79,10 @@ def init_db():
     conn.commit()
 
     # Миграция: добавляем недостающие колонки, если таблица создана более старой версией бота
-    for column in ("photo_id", "price_cny", "price_rub", "delivery_type", "weight_kg", "delivery_rub", "total_rub"):
+    for column in (
+        "photo_id", "price_cny", "price_rub", "delivery_type", "weight_kg",
+        "delivery_rub", "total_rub", "payment_id", "payment_status",
+    ):
         try:
             cur.execute(f"ALTER TABLE orders ADD COLUMN {column} TEXT")
             conn.commit()
@@ -103,7 +114,8 @@ def set_setting(key: str, value: str):
 
 
 def save_order(user_id, username, full_name, product, photo_id, price_cny, price_rub,
-                delivery_type, weight_kg, delivery_rub, total_rub, size, contact, comment):
+                delivery_type, weight_kg, delivery_rub, total_rub, size, contact, comment,
+                payment_status):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
@@ -111,9 +123,9 @@ def save_order(user_id, username, full_name, product, photo_id, price_cny, price
         INSERT INTO orders (
             user_id, username, full_name, product, photo_id, price_cny, price_rub,
             delivery_type, weight_kg, delivery_rub, total_rub,
-            size, contact, comment, created_at
+            size, contact, comment, payment_status, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             user_id,
@@ -130,6 +142,7 @@ def save_order(user_id, username, full_name, product, photo_id, price_cny, price
             size,
             contact,
             comment,
+            payment_status,
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         ),
     )
@@ -143,6 +156,17 @@ def update_order_status(order_id: int, status: str):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
+    conn.commit()
+    conn.close()
+
+
+def update_order_payment(order_id: int, payment_id: str = None, payment_status: str = None):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    if payment_id is not None:
+        cur.execute("UPDATE orders SET payment_id = ? WHERE id = ?", (payment_id, order_id))
+    if payment_status is not None:
+        cur.execute("UPDATE orders SET payment_status = ? WHERE id = ?", (payment_status, order_id))
     conn.commit()
     conn.close()
 
@@ -166,6 +190,56 @@ def get_user_orders(user_id: int):
     rows = cur.fetchall()
     conn.close()
     return rows
+
+
+# ---------- YOOKASSA ----------
+
+def yookassa_configured() -> bool:
+    return bool(config.YOOKASSA_SHOP_ID and config.YOOKASSA_SECRET_KEY)
+
+
+def create_payment(amount_rub: float, order_id: int, bot_username: str):
+    """Создаёт платёж в ЮKassa и возвращает (payment_id, confirmation_url) или (None, None) при ошибке."""
+    try:
+        response = requests.post(
+            YOOKASSA_API_URL,
+            auth=(config.YOOKASSA_SHOP_ID, config.YOOKASSA_SECRET_KEY),
+            headers={
+                "Idempotence-Key": str(uuid.uuid4()),
+                "Content-Type": "application/json",
+            },
+            json={
+                "amount": {"value": f"{amount_rub:.2f}", "currency": "RUB"},
+                "confirmation": {
+                    "type": "redirect",
+                    "return_url": f"https://t.me/{bot_username}",
+                },
+                "capture": True,
+                "description": f"Оплата заказа №{order_id}",
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data["id"], data["confirmation"]["confirmation_url"]
+    except Exception as e:
+        logger.error(f"Ошибка создания платежа ЮKassa: {e}")
+        return None, None
+
+
+def check_payment(payment_id: str):
+    """Возвращает статус платежа: 'succeeded', 'pending', 'canceled' или None при ошибке."""
+    try:
+        response = requests.get(
+            f"{YOOKASSA_API_URL}/{payment_id}",
+            auth=(config.YOOKASSA_SHOP_ID, config.YOOKASSA_SECRET_KEY),
+            timeout=15,
+        )
+        response.raise_for_status()
+        return response.json()["status"]
+    except Exception as e:
+        logger.error(f"Ошибка проверки платежа ЮKassa: {e}")
+        return None
 
 
 # ---------- STATES ----------
@@ -240,6 +314,15 @@ def admin_order_kb(order_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def payment_kb(order_id: int, payment_url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Оплатить", url=payment_url)],
+            [InlineKeyboardButton(text="✅ Я оплатил — проверить", callback_data=f"checkpay_{order_id}")],
+        ]
+    )
+
+
 # ---------- HANDLERS: BASIC ----------
 
 @router.message(CommandStart())
@@ -265,8 +348,8 @@ async def cmd_help(message: Message):
         "Как это работает:\n"
         "1️⃣ Нажми «Оформить заказ»\n"
         "2️⃣ Укажи товар (ссылкой или фото), цену в юанях, способ доставки, размер и контакты\n"
-        "3️⃣ Подтверди заявку — она уйдёт менеджеру\n"
-        "4️⃣ С тобой свяжутся для уточнения деталей и оплаты\n\n"
+        "3️⃣ Подтверди заявку\n"
+        "4️⃣ Если сумма известна — сразу оплати в боте, иначе с тобой свяжется менеджер\n\n"
         "Команды:\n"
         "/order — оформить новый заказ\n"
         "/myorders — посмотреть свои заявки\n"
@@ -377,7 +460,7 @@ async def process_full_name(message: Message, state: FSMContext):
 
 @router.message(OrderForm.product, F.photo)
 async def process_product_photo(message: Message, state: FSMContext):
-    photo_id = message.photo[-1].file_id  # берём фото в максимальном качестве
+    photo_id = message.photo[-1].file_id
     caption = message.caption or ""
     await state.update_data(product=f"[Фото] {caption}".strip(), photo_id=photo_id)
     await state.set_state(OrderForm.price_cny)
@@ -421,9 +504,13 @@ async def process_price(message: Message, state: FSMContext):
 
         rate = get_setting("yuan_rate")
         if rate:
-            price_rub = round(price_value * float(rate), 2)
+            base_rub = price_value * float(rate)
+            price_rub = round(base_rub * (1 + PURCHASE_COMMISSION_PERCENT / 100), 2)
             await state.update_data(price_cny=str(price_value), price_rub=str(price_rub))
-            await message.answer(f"💰 Стоимость товара: {price_rub} ₽")
+            await message.answer(
+                f"💰 Стоимость товара: {price_rub} ₽\n"
+                f"(курс + комиссия за выкуп {PURCHASE_COMMISSION_PERCENT}%)"
+            )
         else:
             await state.update_data(price_cny=str(price_value), price_rub="")
             await message.answer("Курс юаня пока не задан менеджером, посчитаем позже.")
@@ -529,15 +616,15 @@ async def process_contact(message: Message, state: FSMContext):
     )
 
 
-def build_price_lines(data: dict) -> tuple[str, str]:
-    """Возвращает (текст с расшифровкой цены/доставки, итоговая сумма в рублях или '')"""
+def build_price_lines(data: dict) -> tuple[str, str, float]:
+    """Возвращает (текст расшифровки, строка с итогом, число-итог в рублях или 0)"""
     lines = []
     total_rub = None
 
     if data.get("price_cny"):
         line = f"💴 Цена товара: {data['price_cny']} CNY"
         if data.get("price_rub"):
-            line += f" (≈ {data['price_rub']} ₽)"
+            line += f" (≈ {data['price_rub']} ₽ с комиссией {PURCHASE_COMMISSION_PERCENT}%)"
             total_rub = float(data["price_rub"])
         lines.append(line)
 
@@ -554,8 +641,9 @@ def build_price_lines(data: dict) -> tuple[str, str]:
         lines.append("🚚 Доставка: Авиа — стоимость уточняется у менеджера")
 
     text = "\n".join(lines) + ("\n" if lines else "")
-    total_line = f"💰 Итого (без учёта неизвестных пунктов): {round(total_rub, 2)} ₽\n" if total_rub else ""
-    return text, total_line
+    total_value = round(total_rub, 2) if total_rub else 0
+    total_line = f"💰 Итого: {total_value} ₽\n" if total_value else ""
+    return text, total_line, total_value
 
 
 @router.message(OrderForm.comment)
@@ -564,7 +652,7 @@ async def process_comment(message: Message, state: FSMContext):
     await state.update_data(comment=comment)
 
     data = await state.get_data()
-    price_lines, total_line = build_price_lines(data)
+    price_lines, total_line, _ = build_price_lines(data)
 
     product_line = data["product"]
     if data.get("photo_id"):
@@ -594,13 +682,11 @@ async def process_comment(message: Message, state: FSMContext):
 async def confirm_order(message: Message, state: FSMContext):
     data = await state.get_data()
 
-    price_lines, total_line = build_price_lines(data)
-    total_rub_value = ""
-    if total_line:
-        try:
-            total_rub_value = total_line.split(":")[1].split("₽")[0].strip()
-        except Exception:
-            total_rub_value = ""
+    price_lines, total_line, total_value = build_price_lines(data)
+
+    payment_status = "not_required"
+    if yookassa_configured() and total_value > 0:
+        payment_status = "pending"
 
     order_id = save_order(
         user_id=message.from_user.id,
@@ -613,18 +699,13 @@ async def confirm_order(message: Message, state: FSMContext):
         delivery_type=data.get("delivery_type", ""),
         weight_kg=data.get("weight_kg", ""),
         delivery_rub=data.get("delivery_rub", ""),
-        total_rub=total_rub_value,
+        total_rub=str(total_value) if total_value else "",
         size=data["size"],
         contact=data["contact"],
         comment=data["comment"],
+        payment_status=payment_status,
     )
     await state.clear()
-
-    await message.answer(
-        f"✅ Заявка №{order_id} принята!\n"
-        "Менеджер свяжется с тобой в ближайшее время для уточнения деталей и оплаты.",
-        reply_markup=main_menu_kb(),
-    )
 
     admin_text = (
         f"🆕 Новая заявка №{order_id}\n\n"
@@ -637,6 +718,39 @@ async def confirm_order(message: Message, state: FSMContext):
         f"📞 Контакт: {data['contact']}\n"
         f"💬 Комментарий: {data['comment'] or '—'}"
     )
+
+    # Если сумма известна и ЮKassa настроена — создаём платёж и отправляем ссылку клиенту
+    if payment_status == "pending":
+        bot_info = await bot.get_me()
+        payment_id, payment_url = create_payment(total_value, order_id, bot_info.username)
+
+        if payment_id and payment_url:
+            update_order_payment(order_id, payment_id=payment_id)
+            await message.answer(
+                f"✅ Заявка №{order_id} принята!\n\n"
+                f"💰 К оплате: {total_value} ₽\n"
+                "Нажми «Оплатить», чтобы перейти на страницу оплаты. "
+                "После оплаты нажми «Я оплатил — проверить».",
+                reply_markup=main_menu_kb(),
+            )
+            await message.answer(
+                "Оплата заказа:",
+                reply_markup=payment_kb(order_id, payment_url),
+            )
+            admin_text += "\n\n💳 Ожидает оплаты в боте"
+        else:
+            await message.answer(
+                f"✅ Заявка №{order_id} принята!\n"
+                "Не получилось создать ссылку на оплату — менеджер свяжется с тобой для оплаты вручную.",
+                reply_markup=main_menu_kb(),
+            )
+            admin_text += "\n\n⚠️ Не удалось создать платёж автоматически"
+    else:
+        await message.answer(
+            f"✅ Заявка №{order_id} принята!\n"
+            "Менеджер свяжется с тобой в ближайшее время для уточнения деталей и оплаты.",
+            reply_markup=main_menu_kb(),
+        )
 
     for admin_id in config.ADMIN_IDS:
         try:
@@ -651,6 +765,43 @@ async def confirm_order(message: Message, state: FSMContext):
                 await bot.send_message(admin_id, admin_text, reply_markup=admin_order_kb(order_id))
         except Exception as e:
             logger.warning(f"Не удалось отправить уведомление админу {admin_id}: {e}")
+
+
+# ---------- HANDLERS: PAYMENT CHECK ----------
+
+@router.callback_query(F.data.startswith("checkpay_"))
+async def check_payment_callback(callback: CallbackQuery):
+    order_id = int(callback.data.split("_")[1])
+    order = get_order(order_id)
+
+    if not order:
+        await callback.answer("Заказ не найден.", show_alert=True)
+        return
+
+    payment_id = order[16]  # колонка payment_id
+    if not payment_id:
+        await callback.answer("Платёж ещё не создан.", show_alert=True)
+        return
+
+    status = check_payment(payment_id)
+
+    if status == "succeeded":
+        update_order_payment(order_id, payment_status="paid")
+        await callback.message.answer(f"✅ Оплата заказа №{order_id} подтверждена! Спасибо 🙌")
+        await callback.answer("Оплата подтверждена!")
+
+        for admin_id in config.ADMIN_IDS:
+            try:
+                await bot.send_message(admin_id, f"💳 Заказ №{order_id} оплачен клиентом!")
+            except Exception:
+                pass
+
+    elif status == "pending":
+        await callback.answer("Оплата ещё не поступила. Попробуй проверить через минуту.", show_alert=True)
+    elif status == "canceled":
+        await callback.answer("Платёж отменён. Попробуй оформить заказ заново.", show_alert=True)
+    else:
+        await callback.answer("Не получилось проверить статус оплаты. Попробуй чуть позже.", show_alert=True)
 
 
 # ---------- HANDLERS: MY ORDERS ----------
@@ -689,7 +840,7 @@ async def all_orders(message: Message):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, full_name, product, total_rub, size, contact, status, created_at "
+        "SELECT id, full_name, product, total_rub, size, contact, status, payment_status, created_at "
         "FROM orders ORDER BY id DESC LIMIT 30"
     )
     rows = cur.fetchall()
@@ -704,14 +855,20 @@ async def all_orders(message: Message):
         "accepted": "✅ Принята",
         "rejected": "❌ Отклонена",
     }
+    payment_labels = {
+        "not_required": "",
+        "pending": " • 💳 ждёт оплаты",
+        "paid": " • ✅ оплачен",
+    }
 
     lines = ["📋 Последние заказы (макс. 30):\n"]
-    for order_id, full_name, product, total_rub, size, contact, status, created_at in rows:
+    for order_id, full_name, product, total_rub, size, contact, status, payment_status, created_at in rows:
         label = status_labels.get(status, status)
-        product_short = product if len(product) <= 30 else product[:27] + "..."
+        pay_label = payment_labels.get(payment_status, "")
+        product_short = product if len(product) <= 25 else product[:22] + "..."
         total_part = f" • {total_rub}₽" if total_rub else ""
         lines.append(
-            f"№{order_id} • {full_name} • {product_short}{total_part} • {size} • {contact} • {label} • {created_at}"
+            f"№{order_id} • {full_name} • {product_short}{total_part} • {size} • {contact} • {label}{pay_label} • {created_at}"
         )
 
     text = "\n".join(lines)
