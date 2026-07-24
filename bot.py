@@ -45,6 +45,7 @@ def init_db():
             username TEXT,
             full_name TEXT,
             product TEXT,
+            photo_id TEXT,
             price_cny TEXT,
             price_rub TEXT,
             delivery_type TEXT,
@@ -70,7 +71,7 @@ def init_db():
     conn.commit()
 
     # Миграция: добавляем недостающие колонки, если таблица создана более старой версией бота
-    for column in ("price_cny", "price_rub", "delivery_type", "weight_kg", "delivery_rub", "total_rub"):
+    for column in ("photo_id", "price_cny", "price_rub", "delivery_type", "weight_kg", "delivery_rub", "total_rub"):
         try:
             cur.execute(f"ALTER TABLE orders ADD COLUMN {column} TEXT")
             conn.commit()
@@ -101,24 +102,25 @@ def set_setting(key: str, value: str):
     conn.close()
 
 
-def save_order(user_id, username, full_name, product, price_cny, price_rub,
+def save_order(user_id, username, full_name, product, photo_id, price_cny, price_rub,
                 delivery_type, weight_kg, delivery_rub, total_rub, size, contact, comment):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
         """
         INSERT INTO orders (
-            user_id, username, full_name, product, price_cny, price_rub,
+            user_id, username, full_name, product, photo_id, price_cny, price_rub,
             delivery_type, weight_kg, delivery_rub, total_rub,
             size, contact, comment, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             user_id,
             username,
             full_name,
             product,
+            photo_id,
             price_cny,
             price_rub,
             delivery_type,
@@ -262,7 +264,7 @@ async def cmd_help(message: Message):
     await message.answer(
         "Как это работает:\n"
         "1️⃣ Нажми «Оформить заказ»\n"
-        "2️⃣ Укажи товар, цену в юанях, способ доставки, размер и контакты\n"
+        "2️⃣ Укажи товар (ссылкой или фото), цену в юанях, способ доставки, размер и контакты\n"
         "3️⃣ Подтверди заявку — она уйдёт менеджеру\n"
         "4️⃣ С тобой свяжутся для уточнения деталей и оплаты\n\n"
         "Команды:\n"
@@ -367,23 +369,40 @@ async def process_full_name(message: Message, state: FSMContext):
     await state.update_data(full_name=message.text)
     await state.set_state(OrderForm.product)
     await message.answer(
-        "Отправь ссылку на товар с Poizon (или его название/описание, если ссылки нет).",
+        "Отправь ссылку на товар с Poizon.\n"
+        "Если ссылки нет — просто пришли фото товара 📸",
         reply_markup=cancel_kb(),
     )
 
 
-@router.message(OrderForm.product)
-async def process_product(message: Message, state: FSMContext):
-    if not message.text:
-        await message.answer("Пришли текстом ссылку или описание товара.")
-        return
-    await state.update_data(product=message.text)
+@router.message(OrderForm.product, F.photo)
+async def process_product_photo(message: Message, state: FSMContext):
+    photo_id = message.photo[-1].file_id  # берём фото в максимальном качестве
+    caption = message.caption or ""
+    await state.update_data(product=f"[Фото] {caption}".strip(), photo_id=photo_id)
+    await state.set_state(OrderForm.price_cny)
+    await message.answer(
+        "Фото получено ✅\n\n"
+        "Укажи цену товара в юанях (просто число, например: 350).\n"
+        "Если не знаешь цену — нажми «Пропустить».",
+        reply_markup=skip_or_cancel_kb(),
+    )
+
+
+@router.message(OrderForm.product, F.text)
+async def process_product_text(message: Message, state: FSMContext):
+    await state.update_data(product=message.text, photo_id="")
     await state.set_state(OrderForm.price_cny)
     await message.answer(
         "Укажи цену товара в юанях (просто число, например: 350).\n"
         "Если не знаешь цену — нажми «Пропустить».",
         reply_markup=skip_or_cancel_kb(),
     )
+
+
+@router.message(OrderForm.product)
+async def process_product_invalid(message: Message, state: FSMContext):
+    await message.answer("Пришли ссылку текстом или фото товара 📸")
 
 
 @router.message(OrderForm.price_cny)
@@ -547,10 +566,14 @@ async def process_comment(message: Message, state: FSMContext):
     data = await state.get_data()
     price_lines, total_line = build_price_lines(data)
 
+    product_line = data["product"]
+    if data.get("photo_id"):
+        product_line += " (см. фото выше)"
+
     summary = (
         "Проверь данные заказа:\n\n"
         f"👤 Имя: {data['full_name']}\n"
-        f"🛍 Товар: {data['product']}\n"
+        f"🛍 Товар: {product_line}\n"
         f"{price_lines}"
         f"{total_line}"
         f"📏 Размер: {data['size']}\n"
@@ -558,8 +581,13 @@ async def process_comment(message: Message, state: FSMContext):
         f"💬 Комментарий: {data['comment'] or '—'}\n\n"
         "Всё верно?"
     )
+
+    if data.get("photo_id"):
+        await message.answer_photo(photo=data["photo_id"], caption=summary, reply_markup=confirm_kb())
+    else:
+        await message.answer(summary, reply_markup=confirm_kb())
+
     await state.set_state(OrderForm.confirm)
-    await message.answer(summary, reply_markup=confirm_kb())
 
 
 @router.message(OrderForm.confirm, F.text == "✅ Подтвердить")
@@ -569,7 +597,6 @@ async def confirm_order(message: Message, state: FSMContext):
     price_lines, total_line = build_price_lines(data)
     total_rub_value = ""
     if total_line:
-        # извлекаем число из total_line для сохранения в базу
         try:
             total_rub_value = total_line.split(":")[1].split("₽")[0].strip()
         except Exception:
@@ -580,6 +607,7 @@ async def confirm_order(message: Message, state: FSMContext):
         username=message.from_user.username or "—",
         full_name=data["full_name"],
         product=data["product"],
+        photo_id=data.get("photo_id", ""),
         price_cny=data.get("price_cny", ""),
         price_rub=data.get("price_rub", ""),
         delivery_type=data.get("delivery_type", ""),
@@ -609,9 +637,18 @@ async def confirm_order(message: Message, state: FSMContext):
         f"📞 Контакт: {data['contact']}\n"
         f"💬 Комментарий: {data['comment'] or '—'}"
     )
+
     for admin_id in config.ADMIN_IDS:
         try:
-            await bot.send_message(admin_id, admin_text, reply_markup=admin_order_kb(order_id))
+            if data.get("photo_id"):
+                await bot.send_photo(
+                    admin_id,
+                    photo=data["photo_id"],
+                    caption=admin_text,
+                    reply_markup=admin_order_kb(order_id),
+                )
+            else:
+                await bot.send_message(admin_id, admin_text, reply_markup=admin_order_kb(order_id))
         except Exception as e:
             logger.warning(f"Не удалось отправить уведомление админу {admin_id}: {e}")
 
@@ -698,7 +735,10 @@ async def admin_accept(callback: CallbackQuery):
             await bot.send_message(user_id, f"✅ Твоя заявка №{order_id} принята в работу!")
         except Exception:
             pass
-    await callback.message.edit_text(callback.message.text + "\n\n✅ Принята")
+    if callback.message.text:
+        await callback.message.edit_text(callback.message.text + "\n\n✅ Принята")
+    else:
+        await callback.message.edit_caption(caption=(callback.message.caption or "") + "\n\n✅ Принята")
     await callback.answer("Заявка принята")
 
 
@@ -716,7 +756,10 @@ async def admin_reject(callback: CallbackQuery):
             await bot.send_message(user_id, f"❌ Твоя заявка №{order_id} отклонена. Свяжись с менеджером для уточнения деталей.")
         except Exception:
             pass
-    await callback.message.edit_text(callback.message.text + "\n\n❌ Отклонена")
+    if callback.message.text:
+        await callback.message.edit_text(callback.message.text + "\n\n❌ Отклонена")
+    else:
+        await callback.message.edit_caption(caption=(callback.message.caption or "") + "\n\n❌ Отклонена")
     await callback.answer("Заявка отклонена")
 
 
