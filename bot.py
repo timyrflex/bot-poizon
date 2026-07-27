@@ -1,12 +1,14 @@
 import asyncio
+import json
 import logging
 import sqlite3
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -15,7 +17,6 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    ReplyKeyboardRemove,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     CallbackQuery,
@@ -31,11 +32,14 @@ dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
 
-DB_PATH = "orders.db"
-DELIVERY_USD_PER_KG = 8  # стоимость авто-доставки: 8$ за кг
-PURCHASE_COMMISSION_PERCENT = 10  # комиссия за выкуп товара, %
-
+DB_PATH = "usada.db"
 YOOKASSA_API_URL = "https://api.yookassa.ru/v3/payments"
+
+FREQUENCY_LABELS = {
+    "none": "Разовый заказ",
+    "weekly": "Каждую неделю",
+    "monthly": "Каждый месяц",
+}
 
 
 # ---------- DATABASE ----------
@@ -43,6 +47,22 @@ YOOKASSA_API_URL = "https://api.yookassa.ru/v3/payments"
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT,
+            name TEXT,
+            unit TEXT,
+            price_rub REAL,
+            price_tier2 REAL,
+            price_tier10 REAL,
+            active INTEGER DEFAULT 1
+        )
+        """
+    )
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS orders (
@@ -50,41 +70,44 @@ def init_db():
             user_id INTEGER,
             username TEXT,
             full_name TEXT,
-            product TEXT,
-            photo_id TEXT,
-            price_cny TEXT,
-            price_rub TEXT,
-            delivery_type TEXT,
-            weight_kg TEXT,
-            delivery_rub TEXT,
-            total_rub TEXT,
-            size TEXT,
-            contact TEXT,
-            comment TEXT,
-            status TEXT DEFAULT 'new',
+            items_json TEXT,
+            total_rub REAL,
+            address TEXT,
+            phone TEXT,
+            payment_method TEXT,
             payment_id TEXT,
             payment_status TEXT DEFAULT 'not_required',
+            frequency TEXT DEFAULT 'none',
+            status TEXT DEFAULT 'new',
             created_at TEXT
         )
         """
     )
+
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            full_name TEXT,
+            items_json TEXT,
+            total_rub REAL,
+            address TEXT,
+            phone TEXT,
+            payment_method TEXT,
+            frequency TEXT,
+            next_run TEXT,
+            active INTEGER DEFAULT 1
         )
         """
     )
+
     conn.commit()
 
-    # Миграция: добавляем недостающие колонки, если таблица создана более старой версией бота
-    for column in (
-        "photo_id", "price_cny", "price_rub", "delivery_type", "weight_kg",
-        "delivery_rub", "total_rub", "payment_id", "payment_status",
-    ):
+    for column in ("price_tier2", "price_tier10"):
         try:
-            cur.execute(f"ALTER TABLE orders ADD COLUMN {column} TEXT")
+            cur.execute(f"ALTER TABLE products ADD COLUMN {column} REAL")
             conn.commit()
         except sqlite3.OperationalError:
             pass  # колонка уже существует
@@ -92,57 +115,89 @@ def init_db():
     conn.close()
 
 
-def get_setting(key: str, default: str = None):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else default
-
-
-def set_setting(key: str, value: str):
+def add_product(category, name, unit, price_rub, price_tier2=None, price_tier10=None):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO settings (key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (key, value),
+        "INSERT INTO products (category, name, unit, price_rub, price_tier2, price_tier10) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (category, name, unit, price_rub, price_tier2, price_tier10),
     )
+    conn.commit()
+    product_id = cur.lastrowid
+    conn.close()
+    return product_id
+
+
+def get_categories():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT category FROM products WHERE active = 1 ORDER BY category")
+    rows = [r[0] for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def get_products_by_category(category):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, name, unit, price_rub, price_tier2, price_tier10 "
+        "FROM products WHERE category = ? AND active = 1 ORDER BY id",
+        (category,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_all_products():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, category, name, unit, price_rub, price_tier2, price_tier10, active "
+        "FROM products ORDER BY category, id"
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_product(product_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, category, name, unit, price_rub, price_tier2, price_tier10 "
+        "FROM products WHERE id = ?",
+        (product_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def deactivate_product(product_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("UPDATE products SET active = 0 WHERE id = ?", (product_id,))
     conn.commit()
     conn.close()
 
 
-def save_order(user_id, username, full_name, product, photo_id, price_cny, price_rub,
-                delivery_type, weight_kg, delivery_rub, total_rub, size, contact, comment,
-                payment_status):
+def save_order(user_id, username, full_name, items, total_rub, address, phone,
+                payment_method, payment_status, frequency):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
         """
         INSERT INTO orders (
-            user_id, username, full_name, product, photo_id, price_cny, price_rub,
-            delivery_type, weight_kg, delivery_rub, total_rub,
-            size, contact, comment, payment_status, created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            user_id, username, full_name, items_json, total_rub, address, phone,
+            payment_method, payment_status, frequency, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            user_id,
-            username,
-            full_name,
-            product,
-            photo_id,
-            price_cny,
-            price_rub,
-            delivery_type,
-            weight_kg,
-            delivery_rub,
-            total_rub,
-            size,
-            contact,
-            comment,
-            payment_status,
+            user_id, username, full_name, json.dumps(items, ensure_ascii=False), total_rub,
+            address, phone, payment_method, payment_status, frequency,
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         ),
     )
@@ -152,7 +207,7 @@ def save_order(user_id, username, full_name, product, photo_id, price_cny, price
     return order_id
 
 
-def update_order_status(order_id: int, status: str):
+def update_order_status(order_id, status):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
@@ -160,7 +215,7 @@ def update_order_status(order_id: int, status: str):
     conn.close()
 
 
-def update_order_payment(order_id: int, payment_id: str = None, payment_status: str = None):
+def update_order_payment(order_id, payment_id=None, payment_status=None):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     if payment_id is not None:
@@ -171,7 +226,7 @@ def update_order_payment(order_id: int, payment_id: str = None, payment_status: 
     conn.close()
 
 
-def get_order(order_id: int):
+def get_order(order_id):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT * FROM orders WHERE id = ?", (order_id,))
@@ -180,11 +235,11 @@ def get_order(order_id: int):
     return row
 
 
-def get_user_orders(user_id: int):
+def get_user_orders(user_id):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, product, size, status, created_at FROM orders WHERE user_id = ? ORDER BY id DESC",
+        "SELECT id, items_json, total_rub, status, created_at FROM orders WHERE user_id = ? ORDER BY id DESC",
         (user_id,),
     )
     rows = cur.fetchall()
@@ -192,30 +247,87 @@ def get_user_orders(user_id: int):
     return rows
 
 
+def save_subscription(user_id, username, full_name, items, total_rub, address, phone,
+                       payment_method, frequency):
+    days = 7 if frequency == "weekly" else 30
+    next_run = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO subscriptions (
+            user_id, username, full_name, items_json, total_rub, address, phone,
+            payment_method, frequency, next_run
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id, username, full_name, json.dumps(items, ensure_ascii=False), total_rub,
+            address, phone, payment_method, frequency, next_run,
+        ),
+    )
+    conn.commit()
+    sub_id = cur.lastrowid
+    conn.close()
+    return sub_id
+
+
+def get_due_subscriptions():
+    today = datetime.now().strftime("%Y-%m-%d")
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM subscriptions WHERE active = 1 AND next_run <= ?", (today,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def advance_subscription(sub_id, frequency):
+    days = 7 if frequency == "weekly" else 30
+    next_run = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("UPDATE subscriptions SET next_run = ? WHERE id = ?", (next_run, sub_id))
+    conn.commit()
+    conn.close()
+
+
+def get_user_subscriptions(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, items_json, frequency, next_run, active FROM subscriptions WHERE user_id = ? ORDER BY id DESC",
+        (user_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def cancel_subscription(sub_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("UPDATE subscriptions SET active = 0 WHERE id = ?", (sub_id,))
+    conn.commit()
+    conn.close()
+
+
 # ---------- YOOKASSA ----------
 
-def yookassa_configured() -> bool:
+def yookassa_configured():
     return bool(config.YOOKASSA_SHOP_ID and config.YOOKASSA_SECRET_KEY)
 
 
-def create_payment(amount_rub: float, order_id: int, bot_username: str):
-    """Создаёт платёж в ЮKassa и возвращает (payment_id, confirmation_url) или (None, None) при ошибке."""
+def create_payment(amount_rub, order_id, bot_username):
     try:
         response = requests.post(
             YOOKASSA_API_URL,
             auth=(config.YOOKASSA_SHOP_ID, config.YOOKASSA_SECRET_KEY),
-            headers={
-                "Idempotence-Key": str(uuid.uuid4()),
-                "Content-Type": "application/json",
-            },
+            headers={"Idempotence-Key": str(uuid.uuid4()), "Content-Type": "application/json"},
             json={
                 "amount": {"value": f"{amount_rub:.2f}", "currency": "RUB"},
-                "confirmation": {
-                    "type": "redirect",
-                    "return_url": f"https://t.me/{bot_username}",
-                },
+                "confirmation": {"type": "redirect", "return_url": f"https://t.me/{bot_username}"},
                 "capture": True,
-                "description": f"Оплата заказа №{order_id}",
+                "description": f"Оплата заказа №{order_id} — Вода Усада",
             },
             timeout=15,
         )
@@ -223,12 +335,11 @@ def create_payment(amount_rub: float, order_id: int, bot_username: str):
         data = response.json()
         return data["id"], data["confirmation"]["confirmation_url"]
     except Exception as e:
-        logger.error(f"Ошибка создания платежа ЮKassa: {e}")
+        logger.error(f"Ошибка создания платежа: {e}")
         return None, None
 
 
-def check_payment(payment_id: str):
-    """Возвращает статус платежа: 'succeeded', 'pending', 'canceled' или None при ошибке."""
+def check_payment(payment_id):
     try:
         response = requests.get(
             f"{YOOKASSA_API_URL}/{payment_id}",
@@ -238,89 +349,160 @@ def check_payment(payment_id: str):
         response.raise_for_status()
         return response.json()["status"]
     except Exception as e:
-        logger.error(f"Ошибка проверки платежа ЮKassa: {e}")
+        logger.error(f"Ошибка проверки платежа: {e}")
         return None
 
 
 # ---------- STATES ----------
 
-class OrderForm(StatesGroup):
-    full_name = State()
-    product = State()
-    price_cny = State()
-    delivery_type = State()
-    weight_kg = State()
-    size = State()
-    contact = State()
-    comment = State()
+class Checkout(StatesGroup):
+    address = State()
+    phone = State()
+    payment_method = State()
+    frequency = State()
     confirm = State()
+
+
+class AddProduct(StatesGroup):
+    waiting_data = State()
 
 
 # ---------- KEYBOARDS ----------
 
-def main_menu_kb() -> ReplyKeyboardMarkup:
+def main_menu_kb():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🛒 Оформить заказ")],
-            [KeyboardButton(text="📦 Мои заказы"), KeyboardButton(text="ℹ️ Помощь")],
+            [KeyboardButton(text="🛍 Каталог"), KeyboardButton(text="🛒 Корзина")],
+            [KeyboardButton(text="📦 Мои заказы"), KeyboardButton(text="🔁 Мои подписки")],
+            [KeyboardButton(text="ℹ️ Помощь")],
         ],
         resize_keyboard=True,
     )
 
 
-def cancel_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="❌ Отмена")]],
-        resize_keyboard=True,
+def cancel_kb():
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Отмена")]], resize_keyboard=True)
+
+
+def categories_kb(categories):
+    buttons = [[InlineKeyboardButton(text=c, callback_data=f"cat_{c}")] for c in categories]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def product_kb(product_id):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="➕ Добавить в корзину", callback_data=f"add_{product_id}")]]
     )
 
 
-def skip_or_cancel_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Пропустить")], [KeyboardButton(text="❌ Отмена")]],
-        resize_keyboard=True,
-    )
+def cart_kb(cart):
+    buttons = []
+    for item in cart:
+        buttons.append([
+            InlineKeyboardButton(text=f"➖ {item['name']}", callback_data=f"rm_{item['product_id']}"),
+        ])
+    if cart:
+        buttons.append([InlineKeyboardButton(text="🗑 Очистить корзину", callback_data="clearcart")])
+        buttons.append([InlineKeyboardButton(text="✅ Оформить заказ", callback_data="checkout")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def delivery_type_kb() -> ReplyKeyboardMarkup:
+def payment_method_kb():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🚀 Авто (быстро)")],
-            [KeyboardButton(text="✈️ Авиа")],
+            [KeyboardButton(text="💵 Наличными курьеру")],
+            [KeyboardButton(text="💳 Онлайн в боте")],
             [KeyboardButton(text="❌ Отмена")],
         ],
         resize_keyboard=True,
     )
 
 
-def confirm_kb() -> ReplyKeyboardMarkup:
+def frequency_kb():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="✅ Подтвердить")],
+            [KeyboardButton(text="Разовый заказ")],
+            [KeyboardButton(text="Каждую неделю")],
+            [KeyboardButton(text="Каждый месяц")],
             [KeyboardButton(text="❌ Отмена")],
         ],
         resize_keyboard=True,
     )
 
 
-def admin_order_kb(order_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_{order_id}"),
-                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{order_id}"),
-            ]
-        ]
+def confirm_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="✅ Подтвердить")], [KeyboardButton(text="❌ Отмена")]],
+        resize_keyboard=True,
     )
 
 
-def payment_kb(order_id: int, payment_url: str) -> InlineKeyboardMarkup:
+def admin_order_kb(order_id):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Принять", callback_data=f"oaccept_{order_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"oreject_{order_id}"),
+        ]]
+    )
+
+
+def payment_kb(order_id, url):
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Оплатить", url=payment_url)],
+            [InlineKeyboardButton(text="💳 Оплатить", url=url)],
             [InlineKeyboardButton(text="✅ Я оплатил — проверить", callback_data=f"checkpay_{order_id}")],
         ]
     )
+
+
+# ---------- HELPERS ----------
+
+async def safe_edit_text(message, text, reply_markup=None):
+    """Редактирует сообщение, но не падает, если Telegram считает текст неизменённым."""
+    try:
+        await message.edit_text(text, reply_markup=reply_markup)
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
+
+
+def apply_tier_pricing(cart):
+    """Пересчитывает эффективную цену каждой позиции с учётом общего количества
+    товаров с пороговыми ценами (например, бутылей 18,9л) в корзине."""
+    tiered_total_qty = sum(item["qty"] for item in cart if item.get("tier2") or item.get("tier10"))
+
+    for item in cart:
+        if item.get("tier2") or item.get("tier10"):
+            if item.get("tier10") and tiered_total_qty >= 10:
+                item["effective_price"] = item["tier10"]
+            elif item.get("tier2") and tiered_total_qty >= 2:
+                item["effective_price"] = item["tier2"]
+            else:
+                item["effective_price"] = item["price"]
+        else:
+            item["effective_price"] = item["price"]
+
+    return cart
+
+
+def cart_total(cart):
+    cart = apply_tier_pricing(cart)
+    return round(sum(item["effective_price"] * item["qty"] for item in cart), 2)
+
+
+def cart_text(cart):
+    if not cart:
+        return "Корзина пуста. Загляни в 🛍 Каталог, чтобы выбрать товары."
+    cart = apply_tier_pricing(cart)
+    lines = ["🛒 Ваша корзина:\n"]
+    for item in cart:
+        price = item["effective_price"]
+        discount_note = " 🔻" if price < item["price"] else ""
+        lines.append(f"• {item['name']} × {item['qty']} = {price * item['qty']:.0f} ₽{discount_note}")
+    if any(item["effective_price"] < item["price"] for item in cart):
+        lines.append("\n🔻 — применена скидка за объём заказа")
+    lines.append(f"\n💰 Итого: {cart_total(cart):.0f} ₽")
+    return "\n".join(lines)
 
 
 # ---------- HANDLERS: BASIC ----------
@@ -328,15 +510,10 @@ def payment_kb(order_id: int, payment_url: str) -> InlineKeyboardMarkup:
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-
-    rate = get_setting("yuan_rate")
-    rate_line = f"\n💱 Курс юаня: 1 CNY = {rate} ₽\n" if rate else ""
-
     await message.answer(
-        "👋 Привет! Это бот для заказа вещей с Poizon.\n"
-        f"{rate_line}\n"
-        "Заполни короткую форму — я передам заявку менеджеру, "
-        "и с тобой свяжутся для уточнения деталей и оплаты.",
+        "👋 Добро пожаловать в «Вода Усада»!\n\n"
+        "Заказывайте питьевую воду, кулеры и всё необходимое с доставкой на дом или в офис. "
+        "Можно оформить разовый заказ или подписаться на регулярную доставку.",
         reply_markup=main_menu_kb(),
     )
 
@@ -345,426 +522,312 @@ async def cmd_start(message: Message, state: FSMContext):
 @router.message(F.text == "ℹ️ Помощь")
 async def cmd_help(message: Message):
     await message.answer(
-        "Как это работает:\n"
-        "1️⃣ Нажми «Оформить заказ»\n"
-        "2️⃣ Укажи товар (ссылкой или фото), цену в юанях, способ доставки, размер и контакты\n"
-        "3️⃣ Подтверди заявку\n"
-        "4️⃣ Если сумма известна — сразу оплати в боте, иначе с тобой свяжется менеджер\n\n"
+        "Как заказать:\n"
+        "1️⃣ Открой 🛍 Каталог и добавь товары в корзину\n"
+        "2️⃣ Перейди в 🛒 Корзину и нажми «Оформить заказ»\n"
+        "3️⃣ Укажи адрес, телефон и способ оплаты\n"
+        "4️⃣ При желании — подключи регулярную доставку\n\n"
         "Команды:\n"
-        "/order — оформить новый заказ\n"
-        "/myorders — посмотреть свои заявки\n"
-        "/rate — курс юаня\n"
-        "/usdrate — курс доллара (для расчёта доставки)\n"
-        "/cancel — отменить текущее оформление"
+        "/catalog — открыть каталог\n"
+        "/cart — открыть корзину\n"
+        "/myorders — мои заказы\n"
+        "/mysubs — мои подписки\n"
+        "/cancel — отменить оформление"
     )
 
 
 @router.message(Command("cancel"))
 @router.message(F.text == "❌ Отмена")
 async def cmd_cancel(message: Message, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state is None:
+    if await state.get_state() is None:
         await message.answer("Нечего отменять 🙂", reply_markup=main_menu_kb())
         return
     await state.clear()
     await message.answer("Оформление отменено.", reply_markup=main_menu_kb())
 
 
-# ---------- HANDLERS: RATES ----------
+# ---------- HANDLERS: CATALOG ----------
 
-@router.message(Command("setrate"))
-async def set_rate(message: Message):
-    if message.from_user.id not in config.ADMIN_IDS:
-        await message.answer("Эта команда доступна только администратору.")
+@router.message(Command("catalog"))
+@router.message(F.text == "🛍 Каталог")
+async def show_catalog(message: Message):
+    categories = get_categories()
+    if not categories:
+        await message.answer("Каталог пока пуст. Загляните позже 🙂")
         return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.answer("Укажи курс после команды, например:\n/setrate 12.85")
+    await message.answer("Выберите категорию:", reply_markup=categories_kb(categories))
+
+
+@router.callback_query(F.data.startswith("cat_"))
+async def show_category_products(callback: CallbackQuery):
+    category = callback.data[len("cat_"):]
+    products = get_products_by_category(category)
+    if not products:
+        await callback.answer("В этой категории пока нет товаров.", show_alert=True)
         return
-    rate_text = parts[1].replace(",", ".").strip()
-    try:
-        rate_value = float(rate_text)
-    except ValueError:
-        await message.answer("Не понял курс. Пример: /setrate 12.85")
-        return
-    set_setting("yuan_rate", str(rate_value))
-    await message.answer(f"✅ Курс юаня обновлён: 1 CNY = {rate_value} ₽")
-
-
-@router.message(Command("rate"))
-async def show_rate(message: Message):
-    rate = get_setting("yuan_rate")
-    if rate is None:
-        await message.answer("Курс юаня пока не установлен.")
-        return
-    await message.answer(f"💱 Текущий курс: 1 CNY = {rate} ₽")
-
-
-@router.message(Command("setusdrate"))
-async def set_usd_rate(message: Message):
-    if message.from_user.id not in config.ADMIN_IDS:
-        await message.answer("Эта команда доступна только администратору.")
-        return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.answer("Укажи курс после команды, например:\n/setusdrate 95.40")
-        return
-    rate_text = parts[1].replace(",", ".").strip()
-    try:
-        rate_value = float(rate_text)
-    except ValueError:
-        await message.answer("Не понял курс. Пример: /setusdrate 95.40")
-        return
-    set_setting("usd_rate", str(rate_value))
-    await message.answer(f"✅ Курс доллара обновлён: 1 USD = {rate_value} ₽")
-
-
-@router.message(Command("usdrate"))
-async def show_usd_rate(message: Message):
-    rate = get_setting("usd_rate")
-    if rate is None:
-        await message.answer("Курс доллара пока не установлен.")
-        return
-    await message.answer(f"💵 Текущий курс доллара: 1 USD = {rate} ₽")
-
-
-# ---------- HANDLERS: ORDER FORM ----------
-
-@router.message(Command("order"))
-@router.message(F.text == "🛒 Оформить заказ")
-async def start_order(message: Message, state: FSMContext):
-    rate = get_setting("yuan_rate")
-    if rate:
-        await message.answer(f"💱 Курс юаня сейчас: 1 CNY = {rate} ₽")
-
-    await state.set_state(OrderForm.full_name)
-    await message.answer(
-        "Как к тебе обращаться? Напиши имя и фамилию.",
-        reply_markup=cancel_kb(),
-    )
-
-
-@router.message(OrderForm.full_name)
-async def process_full_name(message: Message, state: FSMContext):
-    if not message.text or len(message.text) < 2:
-        await message.answer("Пожалуйста, введи корректное имя.")
-        return
-    await state.update_data(full_name=message.text)
-    await state.set_state(OrderForm.product)
-    await message.answer(
-        "Отправь ссылку на товар с Poizon.\n"
-        "Если ссылки нет — просто пришли фото товара 📸",
-        reply_markup=cancel_kb(),
-    )
-
-
-@router.message(OrderForm.product, F.photo)
-async def process_product_photo(message: Message, state: FSMContext):
-    photo_id = message.photo[-1].file_id
-    caption = message.caption or ""
-    await state.update_data(product=f"[Фото] {caption}".strip(), photo_id=photo_id)
-    await state.set_state(OrderForm.price_cny)
-    await message.answer(
-        "Фото получено ✅\n\n"
-        "Укажи цену товара в юанях (просто число, например: 350).\n"
-        "Если не знаешь цену — нажми «Пропустить».",
-        reply_markup=skip_or_cancel_kb(),
-    )
-
-
-@router.message(OrderForm.product, F.text)
-async def process_product_text(message: Message, state: FSMContext):
-    await state.update_data(product=message.text, photo_id="")
-    await state.set_state(OrderForm.price_cny)
-    await message.answer(
-        "Укажи цену товара в юанях (просто число, например: 350).\n"
-        "Если не знаешь цену — нажми «Пропустить».",
-        reply_markup=skip_or_cancel_kb(),
-    )
-
-
-@router.message(OrderForm.product)
-async def process_product_invalid(message: Message, state: FSMContext):
-    await message.answer("Пришли ссылку текстом или фото товара 📸")
-
-
-@router.message(OrderForm.price_cny)
-async def process_price(message: Message, state: FSMContext):
-    if message.text == "Пропустить":
-        await state.update_data(price_cny="", price_rub="")
-    else:
-        price_text = (message.text or "").replace(",", ".").strip()
-        try:
-            price_value = float(price_text)
-        except ValueError:
-            await message.answer(
-                "Не понял цену. Введи число (например 350) или нажми «Пропустить»."
-            )
-            return
-
-        rate = get_setting("yuan_rate")
-        if rate:
-            base_rub = price_value * float(rate)
-            price_rub = round(base_rub * (1 + PURCHASE_COMMISSION_PERCENT / 100), 2)
-            await state.update_data(price_cny=str(price_value), price_rub=str(price_rub))
-            await message.answer(
-                f"💰 Стоимость товара: {price_rub} ₽\n"
-                f"(курс + комиссия за выкуп {PURCHASE_COMMISSION_PERCENT}%)"
-            )
-        else:
-            await state.update_data(price_cny=str(price_value), price_rub="")
-            await message.answer("Курс юаня пока не задан менеджером, посчитаем позже.")
-
-    await state.set_state(OrderForm.delivery_type)
-    await message.answer(
-        "Выбери способ доставки:\n\n"
-        "🚀 Авто (быстро) — рассчитывается автоматически: 8$ за кг\n"
-        "✈️ Авиа — стоимость уточняется у менеджера отдельно",
-        reply_markup=delivery_type_kb(),
-    )
-
-
-@router.message(OrderForm.delivery_type, F.text == "🚀 Авто (быстро)")
-async def process_delivery_auto(message: Message, state: FSMContext):
-    await state.update_data(delivery_type="Авто (быстро)")
-    await state.set_state(OrderForm.weight_kg)
-    await message.answer(
-        "Укажи примерный вес посылки в кг (например: 1.5).",
-        reply_markup=cancel_kb(),
-    )
-
-
-@router.message(OrderForm.delivery_type, F.text == "✈️ Авиа")
-async def process_delivery_avia(message: Message, state: FSMContext):
-    await state.update_data(
-        delivery_type="Авиа",
-        weight_kg="",
-        delivery_rub="",
-    )
-    await message.answer("✈️ Стоимость авиадоставки менеджер посчитает и уточнит отдельно.")
-    await proceed_to_size(message, state)
-
-
-@router.message(OrderForm.delivery_type)
-async def process_delivery_invalid(message: Message, state: FSMContext):
-    await message.answer("Пожалуйста, выбери способ доставки кнопкой ниже 👇")
-
-
-@router.message(OrderForm.weight_kg)
-async def process_weight(message: Message, state: FSMContext):
-    weight_text = (message.text or "").replace(",", ".").strip()
-    try:
-        weight_value = float(weight_text)
-        if weight_value <= 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("Не понял вес. Введи число больше нуля, например: 1.5")
-        return
-
-    usd_rate = get_setting("usd_rate")
-    delivery_usd = round(weight_value * DELIVERY_USD_PER_KG, 2)
-
-    if usd_rate:
-        delivery_rub = round(delivery_usd * float(usd_rate), 2)
-        await state.update_data(weight_kg=str(weight_value), delivery_rub=str(delivery_rub))
-        await message.answer(
-            f"🚚 Доставка: {weight_value} кг × {DELIVERY_USD_PER_KG}$ = "
-            f"{delivery_usd}$ (≈ {delivery_rub} ₽)"
-        )
-    else:
-        await state.update_data(weight_kg=str(weight_value), delivery_rub="")
-        await message.answer(
-            f"🚚 Доставка: {weight_value} кг × {DELIVERY_USD_PER_KG}$ = {delivery_usd}$\n"
-            "Курс доллара пока не задан менеджером — сумму в рублях посчитаем позже."
+    await callback.answer()
+    await callback.message.answer(f"📦 Категория: {category}")
+    for product_id, name, unit, price, tier2, tier10 in products:
+        price_lines = [f"{unit} — {price:.0f} ₽"]
+        if tier2:
+            price_lines.append(f"от 2 шт — {tier2:.0f} ₽/шт")
+        if tier10:
+            price_lines.append(f"от 10 шт — {tier10:.0f} ₽/шт")
+        await callback.message.answer(
+            f"<b>{name}</b>\n" + "\n".join(price_lines),
+            parse_mode="HTML",
+            reply_markup=product_kb(product_id),
         )
 
-    await proceed_to_size(message, state)
+
+@router.callback_query(F.data.startswith("add_"))
+async def add_to_cart(callback: CallbackQuery, state: FSMContext):
+    product_id = int(callback.data[len("add_"):])
+    product = get_product(product_id)
+    if not product:
+        await callback.answer("Товар недоступен.", show_alert=True)
+        return
+
+    _, category, name, unit, price, tier2, tier10 = product
+    data = await state.get_data()
+    cart = data.get("cart", [])
+
+    for item in cart:
+        if item["product_id"] == product_id:
+            item["qty"] += 1
+            break
+    else:
+        cart.append({
+            "product_id": product_id,
+            "category": category,
+            "name": name,
+            "unit": unit,
+            "price": price,
+            "tier2": tier2,
+            "tier10": tier10,
+            "qty": 1,
+        })
+
+    await state.update_data(cart=cart)
+    await callback.answer(f"Добавлено: {name}")
 
 
-async def proceed_to_size(message: Message, state: FSMContext):
-    await state.set_state(OrderForm.size)
-    await message.answer(
-        "Укажи нужный размер (например: EU 42, US 9, L, или размер в см).",
+# ---------- HANDLERS: CART ----------
+
+@router.message(Command("cart"))
+@router.message(F.text == "🛒 Корзина")
+async def show_cart(message: Message, state: FSMContext):
+    data = await state.get_data()
+    cart = data.get("cart", [])
+    await message.answer(cart_text(cart), reply_markup=cart_kb(cart))
+
+
+@router.callback_query(F.data.startswith("rm_"))
+async def remove_from_cart(callback: CallbackQuery, state: FSMContext):
+    product_id = int(callback.data[len("rm_"):])
+    data = await state.get_data()
+    cart = data.get("cart", [])
+
+    for item in cart:
+        if item["product_id"] == product_id:
+            item["qty"] -= 1
+            if item["qty"] <= 0:
+                cart.remove(item)
+            break
+
+    await state.update_data(cart=cart)
+    await callback.answer("Обновлено")
+    await safe_edit_text(callback.message, cart_text(cart), reply_markup=cart_kb(cart))
+
+
+@router.callback_query(F.data == "clearcart")
+async def clear_cart(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(cart=[])
+    await callback.answer("Корзина очищена")
+    await safe_edit_text(callback.message, cart_text([]), reply_markup=cart_kb([]))
+
+
+# ---------- HANDLERS: CHECKOUT ----------
+
+@router.callback_query(F.data == "checkout")
+async def start_checkout(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    cart = data.get("cart", [])
+    if not cart:
+        await callback.answer("Корзина пуста.", show_alert=True)
+        return
+
+    await callback.answer()
+    await state.set_state(Checkout.address)
+    await callback.message.answer(
+        "Укажи адрес доставки (город, улица, дом, квартира/офис).",
         reply_markup=cancel_kb(),
     )
 
 
-@router.message(OrderForm.size)
-async def process_size(message: Message, state: FSMContext):
-    if not message.text:
-        await message.answer("Укажи размер текстом.")
+@router.message(Checkout.address)
+async def checkout_address(message: Message, state: FSMContext):
+    if not message.text or len(message.text) < 5:
+        await message.answer("Пожалуйста, укажи адрес подробнее.")
         return
-    await state.update_data(size=message.text)
-    await state.set_state(OrderForm.contact)
+    await state.update_data(address=message.text)
+    await state.set_state(Checkout.phone)
+    await message.answer("Укажи номер телефона для связи с курьером.", reply_markup=cancel_kb())
+
+
+@router.message(Checkout.phone)
+async def checkout_phone(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer("Укажи телефон текстом.")
+        return
+    await state.update_data(phone=message.text)
+    await state.set_state(Checkout.payment_method)
+    await message.answer("Как удобнее оплатить?", reply_markup=payment_method_kb())
+
+
+@router.message(Checkout.payment_method, F.text.in_(["💵 Наличными курьеру", "💳 Онлайн в боте"]))
+async def checkout_payment_method(message: Message, state: FSMContext):
+    method = "cash" if "Наличными" in message.text else "online"
+    await state.update_data(payment_method=method)
+    await state.set_state(Checkout.frequency)
     await message.answer(
-        "Оставь контакт для связи: номер телефона или @username.",
-        reply_markup=cancel_kb(),
+        "Оформить как разовый заказ или подключить регулярную доставку?",
+        reply_markup=frequency_kb(),
     )
 
 
-@router.message(OrderForm.contact)
-async def process_contact(message: Message, state: FSMContext):
-    if not message.text:
-        await message.answer("Укажи контакт текстом.")
-        return
-    await state.update_data(contact=message.text)
-    await state.set_state(OrderForm.comment)
-    await message.answer(
-        "Есть дополнительные пожелания или комментарий к заказу? "
-        "Если нет — нажми «Пропустить».",
-        reply_markup=skip_or_cancel_kb(),
-    )
+@router.message(Checkout.payment_method)
+async def checkout_payment_invalid(message: Message):
+    await message.answer("Выбери способ оплаты кнопкой ниже 👇")
 
 
-def build_price_lines(data: dict) -> tuple[str, str, float]:
-    """Возвращает (текст расшифровки, строка с итогом, число-итог в рублях или 0)"""
-    lines = []
-    total_rub = None
-
-    if data.get("price_cny"):
-        line = f"💴 Цена товара: {data['price_cny']} CNY"
-        if data.get("price_rub"):
-            line += f" (≈ {data['price_rub']} ₽ с комиссией {PURCHASE_COMMISSION_PERCENT}%)"
-            total_rub = float(data["price_rub"])
-        lines.append(line)
-
-    delivery_type = data.get("delivery_type", "")
-    if delivery_type == "Авто (быстро)":
-        line = f"🚚 Доставка: Авто, {data.get('weight_kg', '?')} кг"
-        if data.get("delivery_rub"):
-            line += f" (≈ {data['delivery_rub']} ₽)"
-            total_rub = (total_rub or 0) + float(data["delivery_rub"])
-        else:
-            line += " (сумма в рублях уточняется)"
-        lines.append(line)
-    elif delivery_type == "Авиа":
-        lines.append("🚚 Доставка: Авиа — стоимость уточняется у менеджера")
-
-    text = "\n".join(lines) + ("\n" if lines else "")
-    total_value = round(total_rub, 2) if total_rub else 0
-    total_line = f"💰 Итого: {total_value} ₽\n" if total_value else ""
-    return text, total_line, total_value
-
-
-@router.message(OrderForm.comment)
-async def process_comment(message: Message, state: FSMContext):
-    comment = "" if message.text == "Пропустить" else (message.text or "")
-    await state.update_data(comment=comment)
+@router.message(Checkout.frequency, F.text.in_(list(FREQUENCY_LABELS.values())))
+async def checkout_frequency(message: Message, state: FSMContext):
+    freq_map = {v: k for k, v in FREQUENCY_LABELS.items()}
+    frequency = freq_map[message.text]
+    await state.update_data(frequency=frequency)
 
     data = await state.get_data()
-    price_lines, total_line, _ = build_price_lines(data)
-
-    product_line = data["product"]
-    if data.get("photo_id"):
-        product_line += " (см. фото выше)"
+    cart = data.get("cart", [])
+    total = cart_total(cart)
 
     summary = (
-        "Проверь данные заказа:\n\n"
-        f"👤 Имя: {data['full_name']}\n"
-        f"🛍 Товар: {product_line}\n"
-        f"{price_lines}"
-        f"{total_line}"
-        f"📏 Размер: {data['size']}\n"
-        f"📞 Контакт: {data['contact']}\n"
-        f"💬 Комментарий: {data['comment'] or '—'}\n\n"
+        "Проверь заказ:\n\n"
+        f"{cart_text(cart)}\n\n"
+        f"📍 Адрес: {data['address']}\n"
+        f"📞 Телефон: {data['phone']}\n"
+        f"💳 Оплата: {'Наличными курьеру' if data['payment_method'] == 'cash' else 'Онлайн в боте'}\n"
+        f"🔁 Формат: {FREQUENCY_LABELS[frequency]}\n\n"
         "Всё верно?"
     )
-
-    if data.get("photo_id"):
-        await message.answer_photo(photo=data["photo_id"], caption=summary, reply_markup=confirm_kb())
-    else:
-        await message.answer(summary, reply_markup=confirm_kb())
-
-    await state.set_state(OrderForm.confirm)
+    await state.set_state(Checkout.confirm)
+    await message.answer(summary, reply_markup=confirm_kb())
 
 
-@router.message(OrderForm.confirm, F.text == "✅ Подтвердить")
-async def confirm_order(message: Message, state: FSMContext):
+@router.message(Checkout.frequency)
+async def checkout_frequency_invalid(message: Message):
+    await message.answer("Выбери вариант кнопкой ниже 👇")
+
+
+@router.message(Checkout.confirm, F.text == "✅ Подтвердить")
+async def checkout_confirm(message: Message, state: FSMContext):
     data = await state.get_data()
+    cart = apply_tier_pricing(data.get("cart", []))
+    total = cart_total(cart)
 
-    price_lines, total_line, total_value = build_price_lines(data)
+    # Фиксируем итоговую цену на момент заказа — дальше она не должна пересчитываться
+    for item in cart:
+        item["price"] = item["effective_price"]
+
+    address = data["address"]
+    phone = data["phone"]
+    payment_method = data["payment_method"]
+    frequency = data["frequency"]
 
     payment_status = "not_required"
-    if yookassa_configured() and total_value > 0:
+    if payment_method == "online" and yookassa_configured():
         payment_status = "pending"
 
     order_id = save_order(
         user_id=message.from_user.id,
         username=message.from_user.username or "—",
-        full_name=data["full_name"],
-        product=data["product"],
-        photo_id=data.get("photo_id", ""),
-        price_cny=data.get("price_cny", ""),
-        price_rub=data.get("price_rub", ""),
-        delivery_type=data.get("delivery_type", ""),
-        weight_kg=data.get("weight_kg", ""),
-        delivery_rub=data.get("delivery_rub", ""),
-        total_rub=str(total_value) if total_value else "",
-        size=data["size"],
-        contact=data["contact"],
-        comment=data["comment"],
+        full_name=message.from_user.full_name or "—",
+        items=cart,
+        total_rub=total,
+        address=address,
+        phone=phone,
+        payment_method=payment_method,
         payment_status=payment_status,
+        frequency=frequency,
     )
-    await state.clear()
+
+    if frequency != "none":
+        save_subscription(
+            user_id=message.from_user.id,
+            username=message.from_user.username or "—",
+            full_name=message.from_user.full_name or "—",
+            items=cart,
+            total_rub=total,
+            address=address,
+            phone=phone,
+            payment_method=payment_method,
+            frequency=frequency,
+        )
+
+    await state.update_data(cart=[])
+    await state.set_state(None)
 
     admin_text = (
-        f"🆕 Новая заявка №{order_id}\n\n"
-        f"👤 Имя: {data['full_name']}\n"
-        f"🔗 Telegram: @{message.from_user.username or '—'} (id: {message.from_user.id})\n"
-        f"🛍 Товар: {data['product']}\n"
-        f"{price_lines}"
-        f"{total_line}"
-        f"📏 Размер: {data['size']}\n"
-        f"📞 Контакт: {data['contact']}\n"
-        f"💬 Комментарий: {data['comment'] or '—'}"
+        f"🆕 Новый заказ №{order_id}\n\n"
+        f"{cart_text(cart)}\n\n"
+        f"👤 {message.from_user.full_name} (@{message.from_user.username or '—'})\n"
+        f"📍 {address}\n"
+        f"📞 {phone}\n"
+        f"💳 {'Наличными' if payment_method == 'cash' else 'Онлайн'}\n"
+        f"🔁 {FREQUENCY_LABELS[frequency]}"
     )
 
-    # Если сумма известна и ЮKassa настроена — создаём платёж и отправляем ссылку клиенту
     if payment_status == "pending":
         bot_info = await bot.get_me()
-        payment_id, payment_url = create_payment(total_value, order_id, bot_info.username)
-
+        payment_id, payment_url = create_payment(total, order_id, bot_info.username)
         if payment_id and payment_url:
             update_order_payment(order_id, payment_id=payment_id)
             await message.answer(
-                f"✅ Заявка №{order_id} принята!\n\n"
-                f"💰 К оплате: {total_value} ₽\n"
-                "Нажми «Оплатить», чтобы перейти на страницу оплаты. "
-                "После оплаты нажми «Я оплатил — проверить».",
+                f"✅ Заказ №{order_id} оформлен!\n💰 К оплате: {total:.0f} ₽",
                 reply_markup=main_menu_kb(),
             )
-            await message.answer(
-                "Оплата заказа:",
-                reply_markup=payment_kb(order_id, payment_url),
-            )
+            await message.answer("Оплата заказа:", reply_markup=payment_kb(order_id, payment_url))
             admin_text += "\n\n💳 Ожидает оплаты в боте"
         else:
             await message.answer(
-                f"✅ Заявка №{order_id} принята!\n"
-                "Не получилось создать ссылку на оплату — менеджер свяжется с тобой для оплаты вручную.",
+                f"✅ Заказ №{order_id} оформлен!\nОплата наличными курьеру при получении.",
                 reply_markup=main_menu_kb(),
             )
-            admin_text += "\n\n⚠️ Не удалось создать платёж автоматически"
+            admin_text += "\n\n⚠️ Не удалось создать онлайн-платёж — оплата курьеру"
+    elif payment_method == "online" and not yookassa_configured():
+        await message.answer(
+            f"✅ Заказ №{order_id} оформлен!\n"
+            "Онлайн-оплата пока недоступна — с тобой свяжутся, чтобы уточнить оплату.",
+            reply_markup=main_menu_kb(),
+        )
     else:
         await message.answer(
-            f"✅ Заявка №{order_id} принята!\n"
-            "Менеджер свяжется с тобой в ближайшее время для уточнения деталей и оплаты.",
+            f"✅ Заказ №{order_id} оформлен!\n"
+            f"{'Оплата наличными курьеру при получении.' if payment_method == 'cash' else ''}",
             reply_markup=main_menu_kb(),
+        )
+
+    if frequency != "none":
+        await message.answer(
+            f"🔁 Подключена регулярная доставка: {FREQUENCY_LABELS[frequency]}. "
+            "Отменить можно в разделе «🔁 Мои подписки»."
         )
 
     for admin_id in config.ADMIN_IDS:
         try:
-            if data.get("photo_id"):
-                await bot.send_photo(
-                    admin_id,
-                    photo=data["photo_id"],
-                    caption=admin_text,
-                    reply_markup=admin_order_kb(order_id),
-                )
-            else:
-                await bot.send_message(admin_id, admin_text, reply_markup=admin_order_kb(order_id))
+            await bot.send_message(admin_id, admin_text, reply_markup=admin_order_kb(order_id))
         except Exception as e:
-            logger.warning(f"Не удалось отправить уведомление админу {admin_id}: {e}")
+            logger.warning(f"Не удалось уведомить админа {admin_id}: {e}")
 
 
 # ---------- HANDLERS: PAYMENT CHECK ----------
@@ -773,113 +836,203 @@ async def confirm_order(message: Message, state: FSMContext):
 async def check_payment_callback(callback: CallbackQuery):
     order_id = int(callback.data.split("_")[1])
     order = get_order(order_id)
-
     if not order:
         await callback.answer("Заказ не найден.", show_alert=True)
         return
 
-    payment_id = order[16]  # колонка payment_id
+    payment_id = order[9]  # колонка payment_id
     if not payment_id:
         await callback.answer("Платёж ещё не создан.", show_alert=True)
         return
 
     status = check_payment(payment_id)
-
     if status == "succeeded":
         update_order_payment(order_id, payment_status="paid")
         await callback.message.answer(f"✅ Оплата заказа №{order_id} подтверждена! Спасибо 🙌")
         await callback.answer("Оплата подтверждена!")
-
         for admin_id in config.ADMIN_IDS:
             try:
-                await bot.send_message(admin_id, f"💳 Заказ №{order_id} оплачен клиентом!")
+                await bot.send_message(admin_id, f"💳 Заказ №{order_id} оплачен онлайн!")
             except Exception:
                 pass
-
     elif status == "pending":
-        await callback.answer("Оплата ещё не поступила. Попробуй проверить через минуту.", show_alert=True)
-    elif status == "canceled":
-        await callback.answer("Платёж отменён. Попробуй оформить заказ заново.", show_alert=True)
+        await callback.answer("Оплата ещё не поступила. Попробуй через минуту.", show_alert=True)
     else:
-        await callback.answer("Не получилось проверить статус оплаты. Попробуй чуть позже.", show_alert=True)
+        await callback.answer("Не получилось проверить статус оплаты.", show_alert=True)
 
 
-# ---------- HANDLERS: MY ORDERS ----------
+# ---------- HANDLERS: MY ORDERS / SUBSCRIPTIONS ----------
 
 @router.message(Command("myorders"))
 @router.message(F.text == "📦 Мои заказы")
 async def my_orders(message: Message):
     orders = get_user_orders(message.from_user.id)
     if not orders:
-        await message.answer("У тебя пока нет заявок. Нажми «Оформить заказ», чтобы создать первую.")
+        await message.answer("У тебя пока нет заказов.")
         return
-
-    status_labels = {
-        "new": "🆕 Новая",
-        "accepted": "✅ Принята",
-        "rejected": "❌ Отклонена",
-    }
-
-    lines = ["Твои заявки:\n"]
-    for order_id, product, size, status, created_at in orders:
-        label = status_labels.get(status, status)
-        product_short = product if len(product) <= 40 else product[:37] + "..."
-        lines.append(f"№{order_id} • {product_short} • размер {size} • {label} • {created_at}")
-
+    lines = ["Твои заказы:\n"]
+    for order_id, items_json, total, status, created_at in orders:
+        items = json.loads(items_json)
+        items_short = ", ".join(f"{i['name']} ×{i['qty']}" for i in items)
+        lines.append(f"№{order_id} • {items_short} • {total:.0f}₽ • {status} • {created_at}")
     await message.answer("\n".join(lines))
 
 
-# ---------- HANDLERS: ADMIN — ALL ORDERS ----------
+@router.message(Command("mysubs"))
+@router.message(F.text == "🔁 Мои подписки")
+async def my_subscriptions(message: Message):
+    subs = get_user_subscriptions(message.from_user.id)
+    if not subs:
+        await message.answer("У тебя пока нет активных подписок на регулярную доставку.")
+        return
 
-@router.message(Command("allorders"))
-async def all_orders(message: Message):
+    for sub_id, items_json, frequency, next_run, active in subs:
+        if not active:
+            continue
+        items = json.loads(items_json)
+        items_short = ", ".join(f"{i['name']} ×{i['qty']}" for i in items)
+        text = (
+            f"🔁 Подписка №{sub_id}\n"
+            f"{items_short}\n"
+            f"Периодичность: {FREQUENCY_LABELS.get(frequency, frequency)}\n"
+            f"Следующая доставка: {next_run}"
+        )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отменить подписку", callback_data=f"cancelsub_{sub_id}")]]
+        )
+        await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("cancelsub_"))
+async def cancel_sub_callback(callback: CallbackQuery):
+    sub_id = int(callback.data.split("_")[1])
+    cancel_subscription(sub_id)
+    await callback.answer("Подписка отменена")
+    await safe_edit_text(callback.message, callback.message.text + "\n\n❌ Отменена")
+
+
+# ---------- HANDLERS: ADMIN — CATALOG MANAGEMENT ----------
+
+@router.message(Command("addproduct"))
+async def admin_add_product(message: Message):
     if message.from_user.id not in config.ADMIN_IDS:
         await message.answer("Эта команда доступна только администратору.")
         return
-
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id, full_name, product, total_rub, size, contact, status, payment_status, created_at "
-        "FROM orders ORDER BY id DESC LIMIT 30"
+    await message.answer(
+        "Пришли товар в одном из форматов:\n\n"
+        "Без скидок за объём:\n"
+        "Категория | Название | Единица | Цена\n\n"
+        "С скидкой за объём (2-9 шт и 10+ шт):\n"
+        "Категория | Название | Единица | Цена | Цена от 2шт | Цена от 10шт\n\n"
+        "Например:\nВода | Усада 18,9л Минеральная | 1 бутыль | 450 | 310 | 290"
     )
-    rows = cur.fetchall()
-    conn.close()
 
-    if not rows:
-        await message.answer("Заказов пока нет.")
+
+@router.message(F.text.regexp(r"^[^|]+\|[^|]+\|[^|]+\|[^|]+(\|[^|]+\|[^|]+)?\s*$"))
+async def admin_parse_product(message: Message):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    parts = [p.strip() for p in message.text.split("|")]
+    if len(parts) not in (4, 6):
         return
 
-    status_labels = {
-        "new": "🆕 Новая",
-        "accepted": "✅ Принята",
-        "rejected": "❌ Отклонена",
-    }
-    payment_labels = {
-        "not_required": "",
-        "pending": " • 💳 ждёт оплаты",
-        "paid": " • ✅ оплачен",
-    }
+    category, name, unit, price_text = parts[0], parts[1], parts[2], parts[3]
+    try:
+        price = float(price_text.replace(",", "."))
+    except ValueError:
+        await message.answer("Не понял цену за 1 шт. Проверь формат.")
+        return
 
-    lines = ["📋 Последние заказы (макс. 30):\n"]
-    for order_id, full_name, product, total_rub, size, contact, status, payment_status, created_at in rows:
-        label = status_labels.get(status, status)
-        pay_label = payment_labels.get(payment_status, "")
-        product_short = product if len(product) <= 25 else product[:22] + "..."
-        total_part = f" • {total_rub}₽" if total_rub else ""
-        lines.append(
-            f"№{order_id} • {full_name} • {product_short}{total_part} • {size} • {contact} • {label}{pay_label} • {created_at}"
-        )
+    tier2 = tier10 = None
+    if len(parts) == 6:
+        tier2_text, tier10_text = parts[4], parts[5]
+        if tier2_text != "-":
+            try:
+                tier2 = float(tier2_text.replace(",", "."))
+            except ValueError:
+                await message.answer("Не понял цену от 2 шт. Проверь формат.")
+                return
+        if tier10_text != "-":
+            try:
+                tier10 = float(tier10_text.replace(",", "."))
+            except ValueError:
+                await message.answer("Не понял цену от 10 шт. Проверь формат.")
+                return
 
+    product_id = add_product(category, name, unit, price, tier2, tier10)
+    tier_note = ""
+    if tier2 or tier10:
+        tier_note = f" (от 2шт: {tier2 or '—'}₽, от 10шт: {tier10 or '—'}₽)"
+    await message.answer(f"✅ Товар добавлен (id {product_id}): {name} — {price:.0f} ₽{tier_note}")
+
+
+@router.message(Command("products"))
+async def admin_list_products(message: Message):
+    if message.from_user.id not in config.ADMIN_IDS:
+        await message.answer("Эта команда доступна только администратору.")
+        return
+    products = get_all_products()
+    if not products:
+        await message.answer("Каталог пуст.")
+        return
+    lines = ["📦 Каталог:\n"]
+    for pid, category, name, unit, price, tier2, tier10, active in products:
+        mark = "" if active else " (скрыт)"
+        tier_note = ""
+        if tier2 or tier10:
+            tier_note = f" [от2: {tier2 or '—'}₽ / от10: {tier10 or '—'}₽]"
+        lines.append(f"#{pid} [{category}] {name} — {unit}, {price:.0f}₽{tier_note}{mark}")
     text = "\n".join(lines)
     for i in range(0, len(text), 4000):
         await message.answer(text[i:i + 4000])
 
 
-# ---------- HANDLERS: ADMIN CALLBACKS ----------
+@router.message(Command("delproduct"))
+async def admin_del_product(message: Message):
+    if message.from_user.id not in config.ADMIN_IDS:
+        await message.answer("Эта команда доступна только администратору.")
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Укажи id товара: /delproduct 3")
+        return
+    try:
+        product_id = int(parts[1].strip())
+    except ValueError:
+        await message.answer("id должен быть числом.")
+        return
+    deactivate_product(product_id)
+    await message.answer(f"Товар #{product_id} скрыт из каталога.")
 
-@router.callback_query(F.data.startswith("accept_"))
-async def admin_accept(callback: CallbackQuery):
+
+# ---------- HANDLERS: ADMIN — ALL ORDERS ----------
+
+@router.message(Command("allorders"))
+async def admin_all_orders(message: Message):
+    if message.from_user.id not in config.ADMIN_IDS:
+        await message.answer("Эта команда доступна только администратору.")
+        return
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, full_name, total_rub, address, status, payment_status, created_at "
+        "FROM orders ORDER BY id DESC LIMIT 30"
+    )
+    rows = cur.fetchall()
+    conn.close()
+    if not rows:
+        await message.answer("Заказов пока нет.")
+        return
+    lines = ["📋 Последние заказы:\n"]
+    for order_id, full_name, total, address, status, payment_status, created_at in rows:
+        lines.append(f"№{order_id} • {full_name} • {total:.0f}₽ • {address} • {status}/{payment_status} • {created_at}")
+    text = "\n".join(lines)
+    for i in range(0, len(text), 4000):
+        await message.answer(text[i:i + 4000])
+
+
+@router.callback_query(F.data.startswith("oaccept_"))
+async def admin_order_accept(callback: CallbackQuery):
     if callback.from_user.id not in config.ADMIN_IDS:
         await callback.answer("Недостаточно прав.", show_alert=True)
         return
@@ -887,20 +1040,16 @@ async def admin_accept(callback: CallbackQuery):
     update_order_status(order_id, "accepted")
     order = get_order(order_id)
     if order:
-        user_id = order[1]
         try:
-            await bot.send_message(user_id, f"✅ Твоя заявка №{order_id} принята в работу!")
+            await bot.send_message(order[1], f"✅ Твой заказ №{order_id} принят в работу!")
         except Exception:
             pass
-    if callback.message.text:
-        await callback.message.edit_text(callback.message.text + "\n\n✅ Принята")
-    else:
-        await callback.message.edit_caption(caption=(callback.message.caption or "") + "\n\n✅ Принята")
-    await callback.answer("Заявка принята")
+    await safe_edit_text(callback.message, callback.message.text + "\n\n✅ Принят")
+    await callback.answer("Принят")
 
 
-@router.callback_query(F.data.startswith("reject_"))
-async def admin_reject(callback: CallbackQuery):
+@router.callback_query(F.data.startswith("oreject_"))
+async def admin_order_reject(callback: CallbackQuery):
     if callback.from_user.id not in config.ADMIN_IDS:
         await callback.answer("Недостаточно прав.", show_alert=True)
         return
@@ -908,16 +1057,12 @@ async def admin_reject(callback: CallbackQuery):
     update_order_status(order_id, "rejected")
     order = get_order(order_id)
     if order:
-        user_id = order[1]
         try:
-            await bot.send_message(user_id, f"❌ Твоя заявка №{order_id} отклонена. Свяжись с менеджером для уточнения деталей.")
+            await bot.send_message(order[1], f"❌ Твой заказ №{order_id} отклонён. Свяжись с нами для уточнения.")
         except Exception:
             pass
-    if callback.message.text:
-        await callback.message.edit_text(callback.message.text + "\n\n❌ Отклонена")
-    else:
-        await callback.message.edit_caption(caption=(callback.message.caption or "") + "\n\n❌ Отклонена")
-    await callback.answer("Заявка отклонена")
+    await safe_edit_text(callback.message, callback.message.text + "\n\n❌ Отклонён")
+    await callback.answer("Отклонён")
 
 
 # ---------- FALLBACK ----------
@@ -925,16 +1070,67 @@ async def admin_reject(callback: CallbackQuery):
 @router.message()
 async def fallback(message: Message):
     await message.answer(
-        "Не совсем понял 🙂 Используй меню ниже или команду /order, чтобы оформить заказ.",
+        "Не совсем понял 🙂 Используй меню ниже или /catalog, чтобы посмотреть товары.",
         reply_markup=main_menu_kb(),
     )
+
+
+# ---------- SUBSCRIPTION SCHEDULER ----------
+
+async def subscription_checker():
+    while True:
+        try:
+            due = get_due_subscriptions()
+            for sub in due:
+                (sub_id, user_id, username, full_name, items_json, total_rub,
+                 address, phone, payment_method, frequency, next_run, active) = sub
+
+                items = json.loads(items_json)
+                order_id = save_order(
+                    user_id=user_id,
+                    username=username,
+                    full_name=full_name,
+                    items=items,
+                    total_rub=total_rub,
+                    address=address,
+                    phone=phone,
+                    payment_method=payment_method,
+                    payment_status="not_required",
+                    frequency=frequency,
+                )
+                advance_subscription(sub_id, frequency)
+
+                try:
+                    await bot.send_message(
+                        user_id,
+                        f"🔁 Оформлен регулярный заказ №{order_id} по подписке.\n"
+                        f"{cart_text(items)}\n\nМы скоро свяжемся для подтверждения доставки.",
+                    )
+                except Exception:
+                    pass
+
+                for admin_id in config.ADMIN_IDS:
+                    try:
+                        await bot.send_message(
+                            admin_id,
+                            f"🔁 Автозаказ по подписке №{order_id}\n{full_name}, {address}, {phone}\n"
+                            f"{cart_text(items)}",
+                            reply_markup=admin_order_kb(order_id),
+                        )
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.error(f"Ошибка проверки подписок: {e}")
+
+        await asyncio.sleep(12 * 60 * 60)  # проверка каждые 12 часов
 
 
 # ---------- ENTRYPOINT ----------
 
 async def main():
     init_db()
-    logger.info("Бот запущен")
+    asyncio.create_task(subscription_checker())
+    logger.info("Бот Усада запущен")
     await dp.start_polling(bot)
 
 
